@@ -112,6 +112,12 @@ services:
     restart: always
     ports:
       - 8080:8080
+  
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686"   # Web UI
+      - "4318:4318"   # HTTP port for orchestrator spans
 
 volumes:
   qdrant_storage:

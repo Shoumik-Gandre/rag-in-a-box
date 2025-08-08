@@ -3,13 +3,19 @@ import json
 import time
 import uuid
 from contextlib import asynccontextmanager
-from typing import Literal, Optional
+from typing import Annotated, Literal, Optional
 
 import pika
 import pika.exceptions
 import psycopg2
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from pydantic import BaseModel
+from sqlalchemy import create_engine, MetaData
+from sqlalchemy.orm import sessionmaker
+from sqlmodel import SQLModel, Session
+from chonk import chunk_document
+
+from models import IngestRequest, IngestResponse, StatusRequest, StatusResponse, IngestionStatus, ChunkIngestionStatus
 
 
 # ------------------------------
@@ -61,25 +67,11 @@ class AppContext:
             raise RuntimeError(f"RabbitMQ publish failed: {e}") from e
 
     def connect_postgres(self):
-        self.pg_conn = psycopg2.connect(
-            host=self.config.POSTGRES_HOST,
-            port=self.config.POSTGRES_PORT,
-            database=self.config.POSTGRES_DB,
-            user=self.config.POSTGRES_USER,
-            password=self.config.POSTGRES_PASSWORD
-        )
-        self.pg_cursor = self.pg_conn.cursor()
+        self.engine = create_engine(f'postgresql://{self.config.POSTGRES_USER}:{self.config.POSTGRES_PASSWORD}@{self.config.POSTGRES_HOST}:{self.config.POSTGRES_PORT}/{self.config.POSTGRES_DB}')
+        
 
     def _create_postgres_table_if_not_exists(self):
-        self.pg_cursor.execute('''
-            CREATE TABLE IF NOT EXISTS ingestion_status (
-                id UUID PRIMARY KEY,
-                status TEXT CHECK (status IN ('IN_PROGRESS', 'COMPLETED', 'FAILED')),
-                error_message TEXT,
-                updated_at TIMESTAMP DEFAULT NOW()
-            );
-        ''')
-        self.pg_conn.commit()
+        Base.metadata.create_all(self.engine)
         print("Connected to PostgreSQL and ensured table exists.")
 
     def close(self):
@@ -93,14 +85,25 @@ class AppContext:
             self.pg_conn.close()
             print("PostgreSQL connection closed.")
 
-
 # ------------------------------
 # Global Instances
 # ------------------------------
 
 app_config = AppConfig()
 app_context = AppContext(app_config)
+postgres_url = f'postgresql://{app_config.POSTGRES_USER}:{app_config.POSTGRES_PASSWORD}@{app_config.POSTGRES_HOST}:{app_config.POSTGRES_PORT}/{app_config.POSTGRES_DB}'
+engine = create_engine(postgres_url)
 
+
+def create_db_and_tables():
+    SQLModel.metadata.create_all(engine)
+
+
+def get_session():
+    with Session(engine) as session:
+        yield session
+
+SessionDep = Annotated[Session, Depends(get_session)]
 
 # ------------------------------
 # FastAPI with Lifespan
@@ -108,91 +111,53 @@ app_context = AppContext(app_config)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    try:
-        app_context.connect_postgres()
-        app_context._create_postgres_table_if_not_exists()
-        yield
-    finally:
-        app_context.close()
+    create_db_and_tables()
+    yield
 
 
 app = FastAPI(lifespan=lifespan)
 
 
 # ------------------------------
-# Request & Response Models
-# ------------------------------
-
-class IngestRequest(BaseModel):
-    text: str
-
-class IngestResponse(BaseModel):
-    token: str
-
-class StatusRequest(BaseModel):
-    token: str
-
-class StatusResponse(BaseModel):
-    status: Literal["IN_PROGRESS", "FAILED", "COMPLETED"]
-    error_message: Optional[str] = None
-
-# ------------------------------
 # Route
 # ------------------------------
 
 @app.post("/ingest", response_model=IngestResponse)
-async def ingest(request: IngestRequest):
-    token = str(uuid.uuid4())
-    message = {"token": token, "doc": request.text}
+async def ingest(request: IngestRequest, db_session: SessionDep):
+    doc_id = str(uuid.uuid4())
+    chunks = chunk_document(request.text, doc_id)
+    db_session.add(IngestionStatus(id=doc_id, status='IN_PROGRESS', num_chunks=len(chunks)))
+    db_session.commit()
+    for chunk in chunks:
+        try:
+            chunk_id = str(uuid.uuid4())
+            message = {"token":chunk_id, "doc":chunk.text}
+            app_context.publish(message)
+            print(f"Published message: {message}")
+            # Insert into DB with status IN_PROGRESS
+            db_session.add(ChunkIngestionStatus(chunk_id=chunk_id, status='IN_PROGRESS', chunk_index=chunk.metadata.chunk_index, doc_id=chunk.metadata.doc_id))
+            db_session.commit()
+            print(f"Inserted status IN_PROGRESS for chunk_id: {chunk_id} and doc_id: {doc_id}")
 
-    try:
-        app_context.publish(message)
-        print(f"Published message: {message}")
+        except Exception as e:
+            print(f"Publishing failed: {e}")
+            db_session.add(ChunkIngestionStatus(chunk_id=chunk_id, status='FAILED', error_message=str(e), doc_id=doc_id))
+            db_session.add(IngestionStatus(id=doc_id, status='FAILED', error_message=str(e)))
+            db_session.commit()
+            print(f"Inserted status FAILED for chunk_id: {chunk_id} and doc_id: {doc_id}")
 
-        # Insert into DB with status IN_PROGRESS
-        app_context.pg_cursor.execute(
-            """
-            INSERT INTO ingestion_status (id, status)
-            VALUES (%s, %s)
-            """,
-            (token, 'IN_PROGRESS')
-        )
-        app_context.pg_conn.commit()
-        print(f"Inserted status IN_PROGRESS for token: {token}")
-
-    except Exception as e:
-        print(f"Publishing failed: {e}")
-
-        # Insert into DB with status FAILED
-        app_context.pg_cursor.execute(
-            """
-            INSERT INTO ingestion_status (id, status, error_message)
-            VALUES (%s, %s, %s)
-            """,
-            (token, 'FAILED', str(e))
-        )
-        app_context.pg_conn.commit()
-        print(f"Inserted status FAILED for token: {token}")
-
-    return IngestResponse(token=token)
+    return IngestResponse(token=doc_id)
 
 @app.post("/status", response_model=StatusResponse)
-async def status(request: StatusRequest):
+async def status(request: StatusRequest, db_session: SessionDep):
     # take the token from request and check for it exists in postgres and return the status in response
     try:
-        app_context.pg_cursor.execute(
-            """
-            SELECT status FROM ingestion_status
-            WHERE id = (%s)
-            """,
-            (request.token,)
-        )
-        result = app_context.pg_cursor.fetchone()
+        result = db_session.get(IngestionStatus, request.token)
         # select returned empty then return wrong token error message to user
-        if status:
-            return StatusResponse(status=result[0])
-        else:
-            return StatusResponse(status=None, error_message="Wrong token")
+        if not result:
+            raise HTTPException(status_code=404, detail="Ingestion token not found")
+        
+        return StatusResponse(status=result.status)
     except Exception as e:
         # if select threw an exception? That means table does not exist?
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")

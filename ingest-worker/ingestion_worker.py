@@ -2,7 +2,7 @@ import json
 import logging
 import os
 import sys
-from typing import Optional, Self
+from typing import Annotated, Optional, Self
 import uuid
 import pika
 import pika.adapters.blocking_connection
@@ -10,8 +10,12 @@ import pika.exceptions
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
 from fastembed import TextEmbedding
+from sqlmodel import Session, create_engine, select
+from sqlalchemy.engine import Engine
 import tenacity
 import psycopg2
+
+from models import IngestionStatus, ChunkIngestionStatus
 
 logging.basicConfig(stream=sys.stderr, level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -40,6 +44,7 @@ class Application:
         self.rabbit_channel: Optional[pika.adapters.blocking_connection.BlockingChannel] = None
         self.pg_conn: Optional[psycopg2.extensions.cursor] = None
         self.pg_cursor: Optional[psycopg2.extensions.cursor] = None
+        self.engine: Optional[Engine] = None
 
     @tenacity.retry(
             retry=tenacity.retry_if_exception_type(pika.exceptions.AMQPConnectionError), 
@@ -54,33 +59,62 @@ class Application:
         )
     
     def _connect_postgres(self):
-        self.pg_conn = psycopg2.connect(
-            host=self.config.POSTGRES_HOST,
-            port=self.config.POSTGRES_PORT,
-            database=self.config.POSTGRES_DB,
-            user=self.config.POSTGRES_USER,
-            password=self.config.POSTGRES_PASSWORD
-        )
-        self.pg_cursor = self.pg_conn.cursor()
-        print("Connected to PostgreSQL")
+        postgres_url = f'postgresql://{self.config.POSTGRES_USER}:{self.config.POSTGRES_PASSWORD}@{self.config.POSTGRES_HOST}:{self.config.POSTGRES_PORT}/{self.config.POSTGRES_DB}'
+        self.engine = create_engine(postgres_url)
+        
 
     def _update_postgres_success(self, token: uuid):
-        self.pg_cursor.execute('''
-            UPDATE ingestion_status
-            SET status = 'COMPLETED'
-            WHERE id = (%s) and status = 'IN_PROGRESS'
-        ''',(str(token),))
-        self.pg_conn.commit()
-        print('Updated status in Postgres')
+        with Session(self.engine) as session:
+            statement = select(ChunkIngestionStatus).where(ChunkIngestionStatus.chunk_id == token)  
+            results = session.exec(statement)  
+            chunk = results.one()  
+
+            chunk.status = "COMPLETED" 
+            session.add(chunk) 
+
+            statement = select(IngestionStatus).where(IngestionStatus.id == chunk.doc_id)
+            results = session.exec(statement)
+            doc = results.one()
+
+            doc.completed_chunks += 1
+            session.add(doc)
+
+            session.commit()
+            session.refresh(chunk)  
+
+            statement = select(ChunkIngestionStatus).where(ChunkIngestionStatus.doc_id == chunk.doc_id)  
+            results = session.exec(statement)
+            related_chunks = results.all()
+
+            if all(one_chunk.status == "COMPLETED" for one_chunk in related_chunks):
+                statement = select(IngestionStatus).where(IngestionStatus.id == chunk.doc_id)
+                results = session.exec(statement)
+                doc = results.one()
+                doc.status = "COMPLETED"
+                session.add(doc)
+                session.commit()
+                session.refresh(doc)
 
     def _update_postgres_failure(self, token: uuid):
-        self.pg_cursor.execute('''
-            UPDATE ingestion_status
-            SET status = 'FAILED'
-            WHERE id = (%s) and status = 'IN_PROGRESS'
-        ''',str(token),)
-        self.pg_conn.commit()
-        print('Updated status in Postgres')
+        with Session(self.engine) as session:
+            statement = select(ChunkIngestionStatus).where(ChunkIngestionStatus.chunk_id == token)  
+            results = session.exec(statement)  
+            chunk = results.one()  
+
+            # setting status as failed for the entire document
+            statement = select(IngestionStatus).where(IngestionStatus.id == chunk.doc_id)
+            results = session.exec(statement)
+            doc = results.one()
+
+            chunk.status = "FAILED" 
+            doc.status = "FAILED"
+            
+            session.add(chunk) 
+            session.add(doc)
+
+            session.commit()  
+            session.refresh(chunk)
+            session.refresh(doc)
 
     def initialize_services(self):
         # Qdrant
